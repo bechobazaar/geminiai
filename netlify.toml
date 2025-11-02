@@ -1,4 +1,3 @@
-# netlify.toml (repo root)
 [build]
   publish = "."
   functions = "netlify/functions"
@@ -14,24 +13,13 @@
     Cache-Control = "no-store"
     Content-Type = "application/manifest+json; charset=utf-8"
 
-# redirects (tumhare config ke hisaab se)
+# Short path for functions → /api/*
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/:splat"
   status = 200
 
-[[redirects]]
-  from = "/firebase-messaging-sw.js"
-  to = "/firebase-messaging-sw.js"
-  status = 200
-  force = true
-
-[[redirects]]
-  from = "/manifest.webmanifest"
-  to = "/manifest.webmanifest"
-  status = 200
-  force = true
-
+# Canonical domain redirects (optional, if using custom domain)
 [[redirects]]
   from = "http://www.bechobazaar.com/*"
   to = "https://bechobazaar.com/:splat"
@@ -43,3 +31,9 @@
   to = "https://bechobazaar.com/:splat"
   status = 301
   force = true
+
+# (Optional) SPA fallback — sirf agar app single index.html par route hota hai
+# [[redirects]]
+#   from = "/*"
+#   to = "/index.html"
+#   status = 200

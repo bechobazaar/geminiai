@@ -1,156 +1,145 @@
-// netlify/functions/price-advisor-openai.js
+// netlify/functions/price-advisor-web.js
+// Node 18+ (Netlify) — global fetch available
 
-const OPENAI_URL = "https://api.openai.com/v1/responses";
-const DEFAULT_MODEL_FREE = "gpt-4o-mini";
-const DEFAULT_MODEL_PRO  = "gpt-5-mini";
-const DEFAULT_MODEL_VIP  = "gpt-5";
-
-function corsHeaders(origin = "*") {
-  return {
-    "Access-Control-Allow-Origin": origin || "*",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-Plan, X-OpenAI-Model, X-OpenAI-Key",
-    "Vary": "Origin",
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  };
-}
-const ok  = (body, C) => ({ statusCode: 200, headers: C, body: JSON.stringify(body) });
-const bad = (msg, C, code = 400) => ({ statusCode: code, headers: C, body: JSON.stringify({ error: String(msg) }) });
-
-function buildPrompts(input) {
-  const { category="", brand="", model="", city="", state="", price="" } = input || {};
-  const system = [
-    "You are a pricing advisor for an Indian classifieds marketplace.",
-    "Return ONLY JSON (no prose, no code fences).",
-    "Use rupees and Indian numbering (thousand, lakh, crore).",
-    "If details are missing, make reasonable assumptions and set confidence low."
-  ].join("\n");
-
-  const user = [
-    "Make a fair-market price analysis for this listing:",
-    `Category: ${category}`,
-    `Brand: ${brand}`,
-    `Model: ${model}`,
-    `City: ${city}`,
-    `State: ${state}`,
-    `Asking Price (₹): ${price}`,
-    "",
-    "JSON schema to produce (keys in snake_case):",
-    `{
-      "ok": true,
-      "market_price_low": number,
-      "market_price_high": number,
-      "suggested_price": number,
-      "confidence": "low|medium|high",
-      "why": string,
-      "signals": {
-        "brand_strength": "low|med|high",
-        "model_popularity": "low|med|high",
-        "age_wear": "low|med|high",
-        "local_demand": "low|med|high"
-      },
-      "old_vs_new": {
-        "launch_mrp": number|null,
-        "typical_used": number|null
-      }
-    }`
-  ].join("\n");
-
-  return { system, user };
-}
-
-async function callOpenAI({ key, model, system, user }) {
-  const payload = {
-    model,
-    input: [
-      { role: "system", content: system },
-      { role: "user",   content: user   }
-    ],
-    temperature: 0.2,
-    max_output_tokens: 800
-  };
-
-  const resp = await fetch(OPENAI_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
-    body: JSON.stringify(payload)
-  });
-
-  const data = await resp.json().catch(() => ({}));
-  return { ok: resp.ok, status: resp.status, data };
-}
-
-function extractTextFromResponses(json) {
-  try {
-    const out = json?.output || [];
-    if (Array.isArray(out) && out[0]?.content?.length) {
-      return out[0].content.map(p => p?.text || "").join("\n").trim();
-    }
-    const choice = json?.choices?.[0]?.message?.content;
-    if (choice) return String(choice);
-  } catch {}
-  return "";
-}
-
-// strip ```json fences & cut to first {...}
-function coerceJsonString(s = "") {
-  let t = String(s).trim();
-  t = t.replace(/```json|```/gi, "");
-  const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a !== -1 && b !== -1 && b > a) t = t.slice(a, b + 1);
-  t = t.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
-  return t;
-}
-
-function pickModelFromPlan(planHdr, explicitHeaderModel) {
-  if (explicitHeaderModel) return explicitHeaderModel;
-  const plan = String(planHdr || "").toLowerCase();
-  if (plan === "vip") return DEFAULT_MODEL_VIP;
-  if (plan === "pro") return DEFAULT_MODEL_PRO;
-  return DEFAULT_MODEL_FREE;
-}
+const ok = (body, more = {}) => ({
+  statusCode: 200,
+  headers: {
+    "content-type": "application/json",
+    "access-control-allow-origin": "*",
+    "access-control-allow-headers": "content-type, x-plan",
+    "access-control-allow-methods": "POST, OPTIONS",
+    ...more,
+  },
+  body: JSON.stringify(body),
+});
 
 exports.handler = async (event) => {
-  const origin = event.headers.origin || event.headers.Origin || "*";
-  const C = corsHeaders(origin);
+  if (event.httpMethod === "OPTIONS") return ok("");
 
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: C, body: "" };
-  if (event.httpMethod !== "POST")   return bad("POST only", C, 405);
+  if (event.httpMethod !== "POST") {
+    return { statusCode: 400, headers: { "content-type": "application/json" }, body: JSON.stringify({ error: "POST only" }) };
+  }
 
   try {
-    const body = JSON.parse(event.body || "{}");
-    const input = body?.input;
-    if (!input) return bad("Missing 'input' object", C);
+    const { input = {} } = JSON.parse(event.body || "{}");
 
-    const headerModel = event.headers["x-openai-model"] || event.headers["X-OpenAI-Model"];
-    const planHdr     = event.headers["x-plan"]         || event.headers["X-Plan"];
-    const model       = pickModelFromPlan(planHdr, headerModel);
+    // ---- ENV KEYS ----
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY || event.headers["x-openai-key"] || "";
+    const TAVILY_API_KEY = process.env.TAVILY_API_KEY || event.headers["x-tavily-key"] || "";
+    if (!OPENAI_API_KEY) return ok({ error: "Missing OPENAI_API_KEY" });
+    if (!TAVILY_API_KEY) return ok({ error: "Missing TAVILY_API_KEY" });
 
-    const OPENAI_KEY = (event.headers["x-openai-key"] || event.headers["X-OpenAI-Key"] || process.env.OPENAI_API_KEY || "").trim();
-    if (!OPENAI_KEY) return bad("Missing OPENAI_API_KEY", C);
+    // Plan header optional (free = 4o-mini; pro = 5-mini)
+    const plan = (event.headers["x-plan"] || "free").toLowerCase();
+    const model = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
 
-    const { system, user } = buildPrompts(input);
-    const ans = await callOpenAI({ key: OPENAI_KEY, model, system, user });
+    // ---------- 1) Web search (Tavily) ----------
+    const q = buildQuery(input);
+    const tavilyRes = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        query: q,
+        include_answer: true,
+        search_depth: "advanced",
+        max_results: 8,
+        include_domains: [
+          "amazon.in","flipkart.com","reliancedigital.in","croma.com",
+          "olx.in","quikr.com","facebook.com","91mobiles.com","gsmarena.com"
+        ],
+        include_images: false
+      })
+    }).then(r => r.json()).catch(() => ({}));
 
-    if (!ans.ok) {
-      const emsg = ans?.data?.error?.message || JSON.stringify(ans.data || {});
-      if (ans.status === 429 || /quota|exceeded|billing/i.test(emsg)) {
-        return bad("OpenAI: quota/billing limit. Check usage or billing.", C, 429);
-      }
-      return bad(`OpenAI error: ${emsg}`, C, ans.status || 400);
+    const sources = Array.isArray(tavilyRes?.results) ? tavilyRes.results.map(r => ({
+      title: r.title, url: r.url, snippet: r.snippet
+    })) : [];
+
+    // ---------- 2) Synthesis (OpenAI) ----------
+    const system = [
+      "You are a pricing advisor for an Indian classifieds marketplace.",
+      "Use INR. Assume Indian market, locality demand if present.",
+      "You MUST return strict JSON only (no prose / code fences)."
+    ].join("\n");
+
+    const user = [
+      `Task: Estimate market band and three selling tiers (quick/fair/hold).`,
+      `Item: ${input.category||""} · ${input.brand||""} ${input.model||""}`,
+      `Location: ${input.city||""}, ${input.state||""}`,
+      `Seller asking (₹): ${input.price||""}`,
+      input.mobile ? `Mobile details: ${JSON.stringify(input.mobile)}` : "",
+      "",
+      "Recent web snapshots (titles + snippets). Use only as soft evidence:",
+      JSON.stringify(sources.slice(0,8)),
+      "",
+      `Return JSON with keys:
+{
+  "ok": true,
+  "market_price_low": number,
+  "market_price_high": number,
+  "price_tiers": { "quick_sale": number, "fair": number, "hold": number },
+  "suggested_price": number,
+  "confidence": "low|medium|high",
+  "why": string,
+  "signals": {
+    "brand_strength": "low|med|high",
+    "model_popularity": "low|med|high",
+    "age_wear": "low|med|high",
+    "local_demand": "low|med|high"
+  },
+  "old_vs_new": { "launch_mrp": number|null, "typical_used": number|null },
+  "sources": [{ "title": string, "url": string }]
+}
+Rules:
+- Keep price_tiers inside the market band unless strongly justified.
+- quick_sale <= fair <= hold.
+- If condition/warranty/accessories are strong → bias higher; if age/battery/damage poor → bias lower.
+- sources: return 3–6 most relevant from given snapshots (title+url only).
+`
+    ].join("\n");
+
+    const ai = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({
+        model,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user }
+        ]
+      })
+    }).then(r => r.json());
+
+    let jsonText = ai?.choices?.[0]?.message?.content || "";
+    // Try to coerce to JSON if model adds any stray text
+    jsonText = (jsonText || "").trim();
+    const firstBrace = jsonText.indexOf("{");
+    const lastBrace  = jsonText.lastIndexOf("}");
+    if (firstBrace > -1 && lastBrace > firstBrace) jsonText = jsonText.slice(firstBrace, lastBrace + 1);
+
+    let parsed;
+    try { parsed = JSON.parse(jsonText); } catch { parsed = null; }
+
+    if (!parsed || typeof parsed !== "object") {
+      return ok({ error: "LLM parse error", raw: ai });
     }
 
-    const rawText = extractTextFromResponses(ans.data);
-    const jsonStr = coerceJsonString(rawText);
-
-    let parsed = null;
-    try { parsed = JSON.parse(jsonStr); } catch(e) {
-      return bad("Failed to parse JSON from model", C);
-    }
-
-    return ok({ ok: true, provider: "openai", model, result: parsed }, C);
+    // Attach provider/meta
+    return ok({ ok: true, provider: "openai+tavily", model, result: parsed });
   } catch (e) {
-    return bad(e?.message || e, C, 500);
+    return ok({ error: String(e?.message || e) });
   }
 };
+
+// Build a good India-focused query for phones (works for other cats too)
+function buildQuery(input) {
+  const { category="", brand="", model="", city="", state="", price="" } = input || {};
+  const base = `${brand} ${model}`.trim();
+  const loc  = [city, state, "India"].filter(Boolean).join(", ");
+  if ((category||"").toLowerCase() === "mobiles") {
+    return `used price ${base} ${loc} launch MRP used listings olx quikr amazon flipkart`;
+  }
+  return `used price ${category} ${base} ${loc} market price India`;
+}

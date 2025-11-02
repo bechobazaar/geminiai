@@ -60,7 +60,6 @@ function buildPrompts(input) {
   return { system, user };
 }
 
-// NOTE: no response_format — some model variants 400 on it
 async function callOpenAI({ key, model, system, user }) {
   const payload = {
     model,
@@ -82,7 +81,6 @@ async function callOpenAI({ key, model, system, user }) {
   return { ok: resp.ok, status: resp.status, data };
 }
 
-// Responses API text extractor
 function extractTextFromResponses(json) {
   try {
     const out = json?.output || [];
@@ -95,16 +93,12 @@ function extractTextFromResponses(json) {
   return "";
 }
 
-// Strip code fences & pick first {...} block
+// strip ```json fences & cut to first {...}
 function coerceJsonString(s = "") {
   let t = String(s).trim();
-  t = t.replace(/```json|```/gi, "");     // remove code fences if any
-  const firstBrace = t.indexOf("{");
-  const lastBrace  = t.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-    t = t.slice(firstBrace, lastBrace + 1);
-  }
-  // replace smart quotes
+  t = t.replace(/```json|```/gi, "");
+  const a = t.indexOf("{"), b = t.lastIndexOf("}");
+  if (a !== -1 && b !== -1 && b > a) t = t.slice(a, b + 1);
   t = t.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'");
   return t;
 }
@@ -133,7 +127,6 @@ exports.handler = async (event) => {
     const planHdr     = event.headers["x-plan"]         || event.headers["X-Plan"];
     const model       = pickModelFromPlan(planHdr, headerModel);
 
-    // Prefer env; allow header only for testing
     const OPENAI_KEY = (event.headers["x-openai-key"] || event.headers["X-OpenAI-Key"] || process.env.OPENAI_API_KEY || "").trim();
     if (!OPENAI_KEY) return bad("Missing OPENAI_API_KEY", C);
 

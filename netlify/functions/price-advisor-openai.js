@@ -1,7 +1,5 @@
 // netlify/functions/price-advisor-openai.js
-// Node 18+ runtime
-
-const fetch = (...a) => import('node-fetch').then(({default:f})=>f(...a));
+// Node 18+ runtime — built-in fetch() is available, no node-fetch
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -9,20 +7,19 @@ const CORS = {
   "Access-Control-Allow-Headers": "Content-Type, x-openai-key"
 };
 
-// Prefer env var OPENAI_API_KEY. For testing, you can send header x-openai-key.
 const OPENAI_URL = "https://api.openai.com/v1/responses";
-const MODEL = "gpt-4o-mini"; // fast + supports tools
+const MODEL = "gpt-4o-mini";
 
-const ok = (body)=>({ statusCode:200, headers:CORS, body: JSON.stringify(body) });
-const bad = (s)=>({ statusCode:400, headers:CORS, body: JSON.stringify({ error:String(s) }) });
+const ok  = (body)=>({ statusCode:200, headers:CORS, body: JSON.stringify(body) });
+const bad = (msg)=>({ statusCode:400, headers:CORS, body: JSON.stringify({ error:String(msg) }) });
 
-exports.handler = async (event)=>{
-  if(event.httpMethod==="OPTIONS") return { statusCode:204, headers:CORS, body:"" };
-  if(event.httpMethod!=="POST") return bad("POST only");
+exports.handler = async (event) => {
+  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
+  if (event.httpMethod !== "POST")   return bad("POST only");
 
-  try{
-    const { input } = JSON.parse(event.body||"{}");
-    if(!input) return bad("missing input");
+  try {
+    const { input } = JSON.parse(event.body || "{}");
+    if (!input) return bad("missing input");
 
     const {
       category, subCategory, sellerType, brand, model, title,
@@ -38,90 +35,75 @@ exports.handler = async (event)=>{
       title || `${brand||''} ${model||''}`.trim(),
       category, subCategory, propertyType, bhk,
       city, state, area,
-      yearOfPurchase? `year ${yearOfPurchase}` : '',
-      kmDriven? `${kmDriven} km` : '',
+      yearOfPurchase ? `year ${yearOfPurchase}` : '',
+      kmDriven ? `${kmDriven} km` : '',
       ownership, tyreCondition, accidentStatus, allPapersAvail,
     ].filter(Boolean).join(' • ');
 
     const system = `
 You are a price advisor for a classifieds marketplace in India.
-Use web_search to fetch 5-10 recent comparable listings (same city/state first, then nearby/statewide) and *recent sold* if available.
-Return *structured JSON* only with:
+Use web_search to fetch 5-10 recent comparable listings (same city/state first, then nearby/statewide) and any recent sold prices.
+Return *only* JSON:
 {
-  "market_price": number,                 // median of good comps (INR)
-  "price_band": { "low": number, "high": number },
-  "suggestion": number,                    // good listing price for quick sale
+  "market_price": number,
+  "price_band": {"low": number, "high": number},
+  "suggestion": number,
   "confidence": "low|medium|high",
-  "condition_note": string,               // how condition/age/owner/accident affects it
-  "notes": string,                        // short reasoning (<= 2 lines)
-  "old_sold_samples": [                   // up to 6 items
+  "condition_note": string,
+  "notes": string,
+  "old_sold_samples": [
     {"title": string, "price": number, "location": string, "date": string, "url": string, "condition": string, "note": string}
   ]
 }
-
-Condition modifiers (rough guide):
-- Vehicles: New/Good tyres + no accidents + all papers + 1st owner => +5–10%;
-  Minor accidents, worn tyres, 2nd/3rd owner, expiring/expired PUC/insurance => -5–15%.
-- Mobiles/Electronics: age > 2 years or heavy wear => -10–20%; mint/boxed => +5–10%.
-- Properties: adjust for furnishing, facing (Vaastu), BHK, area (₹/sqft) with comparable locality.
-
-Always output valid JSON. Currency is INR only (no commas).`;
+Adjust for condition/age/ownership as described. Currency INR, plain numbers (no commas).`;
 
     const user = `
 Item: ${title || `${brand||''} ${model||''}`.trim()}
-Category: ${category || ''}
-Subcategory: ${subCategory || ''}
-Brand: ${brand || ''}
-Model: ${model || ''}
-Vehicle details: year=${yearOfPurchase||''}, km=${kmDriven||''}, owner=${ownership||''}, tyre=${tyreCondition||''}, accident=${accidentStatus||''}, papers=${allPapersAvail||''}, PUC=${pollutionExpiry||''}, tax=${taxExpiry||''}, insurance=${insuranceExpiry||''}
+Category: ${category||''}
+Subcategory: ${subCategory||''}
+Brand: ${brand||''}
+Model: ${model||''}
+Vehicle: year=${yearOfPurchase||''}, km=${kmDriven||''}, owner=${ownership||''}, tyre=${tyreCondition||''}, accident=${accidentStatus||''}, papers=${allPapersAvail||''}, PUC=${pollutionExpiry||''}, tax=${taxExpiry||''}, insurance=${insuranceExpiry||''}
 Property: type=${propertyType||''}, bhk=${bhk||''}, area_sqft=${propertyArea||''}, facing=${facing||''}, furnishing=${furnishing||''}, beds=${bedrooms||''}, baths=${bathrooms||''}
 Location: ${area? area+', ':''}${city||''}, ${state||''}
-Asking price: ${price || ''}
+Asking price: ${price||''}
+Short description: ${descPlain?.slice(0,240)||''}
+Search intent: Find recent comparable listings and sold in/near ${city||state||'India'} for "${userQuery}".`;
 
-Short description: ${descPlain?.slice(0,240) || ''}
+    const key = process.env.OPENAI_API_KEY
+      || event.headers['x-openai-key']
+      || event.headers['X-OpenAI-Key'];
+    if (!key) return bad("Missing OpenAI API key");
 
-Search intent: Find recent comparable listings and sold records in/near ${city||state||'India'} for "${userQuery}".`;
-
-    const key = process.env.OPENAI_API_KEY || event.headers['x-openai-key'] || event.headers['X-OpenAI-Key'];
-    if(!key) return bad("Missing OpenAI API key");
-
-    // Responses API with web_search tool (per OpenAI docs)
     const payload = {
       model: MODEL,
       reasoning: { effort: "medium" },
       input: [
-        { role:"system", content: system },
-        { role:"user", content: user }
+        { role: "system", content: system },
+        { role: "user",   content: user }
       ],
-      tools: [{ type: "web_search" }], // enable grounded search
+      tools: [{ type: "web_search" }],
       response_format: { type: "json_object" },
-      // small safety: cap cost/time
       max_output_tokens: 900
     };
 
-    const r = await fetch(OPENAI_URL, {
-      method:'POST',
-      headers:{ 'content-type':'application/json', 'authorization':`Bearer ${key}` },
+    const resp = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { "content-type":"application/json", "authorization": `Bearer ${key}` },
       body: JSON.stringify(payload)
     });
+    const data = await resp.json();
+    if (!resp.ok) return bad(data?.error?.message || JSON.stringify(data));
 
-    const data = await r.json();
-    if(!r.ok){
-      // If org doesn't have web_search enabled, return a friendly error.
-      return bad(data?.error?.message || JSON.stringify(data));
-    }
-
-    // The Responses API returns output in "output[0].content[0].text" when json_object is used.
     let parsed = null;
-    try{
+    try {
       const text = data?.output?.[0]?.content?.[0]?.text ?? data?.output_text ?? '';
       parsed = text && JSON.parse(text);
-    }catch(_){}
+    } catch(_) {}
 
-    if(!parsed) return bad("Failed to parse response");
-
+    if (!parsed) return bad("Failed to parse response");
     return ok({ result: parsed, _meta: { q: userQuery } });
-  }catch(e){
+  } catch (e) {
     return bad(e.message || e);
   }
 };

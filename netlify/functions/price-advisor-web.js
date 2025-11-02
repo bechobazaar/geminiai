@@ -1,215 +1,166 @@
-/* netlify/functions/price-advisor-web.js
-   - Directly callable from your front-end.
-   - Robust CORS (OPTIONS + success + error paths).
-   - Uses Tavily (optional) + OpenAI to produce market band + fair price.
-*/
+// netlify/functions/price-advisor-web.js
+// Node 18+ on Netlify: global fetch is available; do NOT import node-fetch.
 
-const ORIGINS = [
+const ALLOW_ORIGINS = [
   "https://bechobazaar.com",
   "https://www.bechobazaar.com",
-  "https://bechobazaarui.netlify.app",
-  // "http://localhost:8888", // dev
+  "https://bechobazaarui.netlify.app"
 ];
 
 function corsHeaders(event) {
-  const reqOrigin = event.headers?.origin || "";
-  const allow = ORIGINS.includes(reqOrigin);
+  const origin = event.headers?.origin || "";
   const h = {
     "Vary": "Origin",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, X-Plan",
     "Access-Control-Max-Age": "600",
   };
-  if (allow) h["Access-Control-Allow-Origin"] = reqOrigin;
+  if (ALLOW_ORIGINS.includes(origin)) h["Access-Control-Allow-Origin"] = origin;
   return h;
 }
-const ok  = (event, body) => ({ statusCode: 200, headers: corsHeaders(event), body: JSON.stringify(body) });
-const bad = (event, code, msg) => ({ statusCode: code, headers: corsHeaders(event), body: JSON.stringify({ error: msg }) });
 
-const OPENAI_KEY  = process.env.OPENAI_API_KEY || "";
-const TAVILY_KEY  = process.env.TAVILY_API_KEY || "";
-
-async function tavilySearch(q) {
-  if (!TAVILY_KEY) return { results: [], used: false };
-  const r = await fetch("https://api.tavily.com/search", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Tavily-API-Key": TAVILY_KEY },
-    body: JSON.stringify({
-      query: q,
-      search_depth: "advanced",
-      include_answer: false,
-      include_images: false,
-      max_results: 8,
-      topic: "general",
-      days: 365, // up to a year
-      include_domains: [
-        "amazon.in","flipkart.com","croma.com","relianceDigital.in","apple.com/in",
-        "olx.in","quikr.com","91mobiles.com","smartprix.com","pricebaba.com",
-        "facebook.com","x.com","gsmarena.com"
-      ]
-    })
-  });
-  if (!r.ok) return { results: [], used: true };
-  const j = await r.json().catch(()=> ({}));
-  const items = Array.isArray(j.results) ? j.results : [];
-  return { results: items.map(x => ({
-    title: x.title, url: x.url, snippet: x.content?.slice(0, 400) || ""
-  })), used: true };
+function ok(body, event) {
+  return { statusCode: 200, headers: corsHeaders(event), body: JSON.stringify(body) };
+}
+function bad(status, msg, event) {
+  return { statusCode: status, headers: corsHeaders(event), body: JSON.stringify({ error: msg }) };
 }
 
-async function askOpenAI({ plan, input, web }) {
-  const useModel = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
-  const sys = `You are a price advisor for a classifieds marketplace in India.
-Return concise JSON only, no prose. 
-Fields:
-- market_price_low (number, INR)
-- market_price_high (number, INR)
-- suggested_price (number, INR)  // fast sale, fair but realistic
-- confidence ("low"|"medium"|"high")
-- why (string, <= 400 chars)
-- old_vs_new: { launch_mrp?: number, typical_used?: number }
-- sources: [{title,url}]
-Rules:
-- If input lacks key details, still estimate from brand/model/category & city/state context.
-- Prefer INR amounts rounded to nearest 100/500.
-- Suggested price must be inside [low, high].
-`;
+async function tavilySearch(q) {
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) return [];
+  try {
+    const r = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-api-key": key },
+      body: JSON.stringify({ query: q, include_answer: false, max_results: 5 })
+    });
+    if (!r.ok) return [];
+    const j = await r.json();
+    const hits = Array.isArray(j.results) ? j.results : [];
+    return hits.map(x => ({
+      title: x.title || "",
+      url: x.url || "",
+      snippet: x.content || x.snippet || ""
+    }));
+  } catch {
+    return [];
+  }
+}
+
+async function callOpenAI({ model, input, sources }) {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) throw new Error("OPENAI_API_KEY missing");
+
+  const sys = [
+    "You are a pricing analyst for a classifieds app in India.",
+    "Return ONLY valid JSON. No markdown. Shape:",
+    `{
+      "suggested_price": number,
+      "market_price_low": number,
+      "market_price_high": number,
+      "confidence": "low"|"medium"|"high",
+      "why": string,
+      "old_vs_new": { "launch_mrp": number|null, "typical_used": number|null },
+      "sources": [ { "title": string, "url": string } ]
+    }`,
+    "Logic:",
+    "- Use Indian market context and INR.",
+    "- If brand/model present, bias to India (Flipkart/Amazon/OLX/Quikr references are fine).",
+    "- If no web sources provided, still estimate with wider band and set confidence lower.",
+    "- Suggested price should be inside the band and biased towards quick sale (10–15% below median if needed)."
+  ].join("\n");
 
   const user = {
     role: "user",
-    content: [
-      { type: "text", text:
-`INPUT:
-${JSON.stringify(input, null, 2)}
-
-WEB_SNIPPETS:
-${JSON.stringify(web?.results?.slice(0,6) || [], null, 2)}
-` }
-    ]
+    content:
+      JSON.stringify({
+        input,
+        web_snippets: (sources || []).map(s => ({
+          title: s.title, url: s.url, snippet: (s.snippet || "").slice(0, 500)
+        }))
+      })
   };
 
-  // Use Chat Completions for maximum compatibility
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_KEY}` },
+    headers: { "authorization": `Bearer ${key}`, "content-type": "application/json" },
     body: JSON.stringify({
-      model: useModel,
+      model,
+      temperature: 0.2,
       messages: [
         { role: "system", content: sys },
         user
-      ],
-      temperature: 0.2
+      ]
     })
   });
 
   if (!r.ok) {
     const t = await r.text().catch(()=> "");
-    throw new Error(`OpenAI error: ${t || r.status}`);
+    throw new Error(`OpenAI error: ${t || r.statusText}`);
   }
-
   const j = await r.json();
-  const txt = j?.choices?.[0]?.message?.content || "{}";
-  // Try to parse JSON from the model
-  let parsed = {};
-  try {
-    // Accept plain JSON or fenced
-    const m = txt.match(/```json([\s\S]*?)```/i);
-    const raw = m ? m[1] : txt;
-    parsed = JSON.parse(raw);
-  } catch {
-    // fallback: naive extraction
-    parsed = { why: txt };
-  }
-  return { model: useModel, result: parsed };
+  const text = j?.choices?.[0]?.message?.content || "{}";
+
+  // Try to parse JSON only (strip accidental extra)
+  const maybe = text.match(/\{[\s\S]*\}$/);
+  let parsed;
+  try { parsed = JSON.parse(maybe ? maybe[0] : text); }
+  catch { parsed = {}; }
+  return parsed;
 }
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: corsHeaders(event), body: "" };
-  if (event.httpMethod !== "POST") return bad(event, 400, "POST only");
-  if (!OPENAI_KEY) return bad(event, 500, "OPENAI_API_KEY missing");
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: corsHeaders(event), body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return bad(405, "POST only", event);
+  }
 
   try {
-    const { input = {} } = JSON.parse(event.body || "{}");
-    const plan = String(event.headers["x-plan"] || "free").toLowerCase();
-
-    // 1) Normalize input (ensure strings)
-    const data = {
-      category: String(input.category || ""),
-      brand: String(input.brand || ""),
-      model: String(input.model || ""),
-      city: String(input.city || ""),
-      state: String(input.state || ""),
-      price: String(input.price || "")
-    };
-
-    // 2) Build Tavily queries
-    const qParts = [
-      [data.brand, data.model].filter(Boolean).join(" "),
-      data.category || "",
-      "used price India"
-    ].filter(Boolean).join(" ").trim();
-
-    const qLaunch = [
-      [data.brand, data.model].filter(Boolean).join(" "),
-      "launch price India MRP"
-    ].filter(Boolean).join(" ").trim();
-
-    // 3) Tavily
-    const [usedRes, launchRes] = await Promise.all([
-      tavilySearch(qParts),
-      tavilySearch(qLaunch)
-    ]);
-
-    // Merge web snippets, dedupe by url
-    const byUrl = new Map();
-    [...(usedRes.results||[]), ...(launchRes.results||[])]
-      .forEach(x => { if (x?.url && !byUrl.has(x.url)) byUrl.set(x.url, x); });
-
-    const web = { results: Array.from(byUrl.values()).slice(0, 10), used: usedRes.used || launchRes.used };
-
-    // 4) Ask OpenAI
-    const ans = await askOpenAI({ plan, input: data, web });
-
-    // 5) Guardrails: enforce numeric & band logic
-    const r = ans.result || {};
-    const toN = v => (v==null || isNaN(Number(v))) ? null : Math.round(Number(v));
-    let low = toN(r.market_price_low);
-    let high = toN(r.market_price_high);
-    let sug = toN(r.suggested_price);
-
-    // basic repairs
-    if (low && high && low > high) { const t = low; low = high; high = t; }
-    if (!sug && low && high) sug = Math.round((low + high) / 2);
-    if (sug && low && high) {
-      if (sug < low) sug = low;
-      if (sug > high) sug = high;
+    const { input } = JSON.parse(event.body || "{}");
+    if (!input || !input.price || !input.category) {
+      return bad(400, "input.category and input.price are required", event);
     }
 
-    // build final
-    const final = {
+    // Build a compact Tavily query
+    const q = [
+      input.brand, input.model, "used price", input.city || input.state || "India"
+    ].filter(Boolean).join(" ");
+    const sources = await tavilySearch(q);
+
+    // Choose model
+    const plan = (event.headers?.["x-plan"] || event.headers?.["X-Plan"] || "free").toLowerCase();
+    const model = plan === "pro" ? "gpt-5-mini" : "gpt-4o-mini";
+
+    const result = await callOpenAI({ model, input, sources });
+
+    // Normalize a bit
+    const num = (v)=> (typeof v === "number" && isFinite(v) ? Math.round(v) : null);
+    const out = {
       ok: true,
       provider: "openai",
-      model: ans.model,
+      model,
       result: {
-        market_price_low: low || null,
-        market_price_high: high || null,
-        suggested_price: sug || null,
-        confidence: (r.confidence || "medium").toLowerCase(),
-        why: r.why || "Estimated from brand/model category and web signals.",
+        suggested_price: num(result.suggested_price),
+        market_price_low: num(result.market_price_low),
+        market_price_high: num(result.market_price_high),
+        confidence: result.confidence || "medium",
+        why: result.why || "",
         old_vs_new: {
-          launch_mrp: toN(r?.old_vs_new?.launch_mrp),
-          typical_used: toN(r?.old_vs_new?.typical_used)
+          launch_mrp: num(result?.old_vs_new?.launch_mrp),
+          typical_used: num(result?.old_vs_new?.typical_used)
         },
-        sources: (r.sources || web.results || []).slice(0,6).map(s => ({
-          title: s.title || "source",
-          url: s.url
-        }))
+        sources: Array.isArray(result.sources) ? result.sources.slice(0,6).map(s=>({
+          title: s.title || "",
+          url: s.url || ""
+        })) : []
       }
     };
 
-    return ok(event, final);
-
+    return ok(out, event);
   } catch (e) {
-    return bad(event, 400, String(e?.message || e));
+    return bad(400, String(e.message || e), event);
   }
 };

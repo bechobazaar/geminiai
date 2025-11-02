@@ -1,0 +1,13 @@
+[build]
+  publish = "."
+  command = ""
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[build.environment]
+  NODE_VERSION = "18"
+
+[functions."auto-bump"]
+  schedule = "*/10 * * * *"   # every 10 minutes (UTC)

@@ -1,17 +1,19 @@
 // netlify/functions/price-advisor-openai.js
-// Node 18+ runtime (built-in fetch). Uses OpenAI Responses API.
-// Returns a structured price analysis JSON. Includes strict CORS for cross-origin use.
+// Node 18+ (built-in fetch). Uses OpenAI "responses" API.
+// Returns structured market-price analysis JSON for your form.
 
 const OPENAI_URL = "https://api.openai.com/v1/responses";
-const MODEL = "gpt-4o-mini";
 
-// --- CORS (allow only your sites) ---
+// Default model (you can switch to "gpt-5")
+const DEFAULT_MODEL = "gpt-5-mini";
+
+// --- CORS: allow only your sites (edit this list) ---
 const ALLOWED = new Set([
   "https://bechobazaar.com",
   "https://www.bechobazaar.com",
-  // add your new Netlify site here:
+  // add your new Netlify site domain here:
   "https://<YOUR-NEW-SITE>.netlify.app",
-  // optionally any staging:
+  // keep if you still test on the old one:
   "https://bechobazaarui.netlify.app"
 ]);
 
@@ -20,7 +22,7 @@ function corsHeaders(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-openai-key",
+    "Access-Control-Allow-Headers": "Content-Type, x-openai-key, x-openai-model",
     "Vary": "Origin"
   };
 }
@@ -28,8 +30,9 @@ function corsHeaders(origin) {
 const ok  = (body, CORS) => ({ statusCode: 200, headers: CORS, body: JSON.stringify(body) });
 const bad = (msg,  CORS) => ({ statusCode: 400, headers: CORS, body: JSON.stringify({ error: String(msg) }) });
 
-// Extract primary text from Responses API (covers a few shapes)
+// Extract text from Responses API
 function extractText(respJson) {
+  // try the most common shapes
   const t1 = respJson?.output?.[0]?.content?.[0]?.text;
   if (t1) return t1;
   if (respJson?.output_text) return respJson.output_text;
@@ -68,22 +71,22 @@ function buildPrompts(input) {
   const system = `
 You are a price advisor for a classifieds marketplace in India.
 
-Derive 5–10 recent comparable listings (prioritize same city/state; else nearby/statewide) and any recent SOLD prices.
+Derive 5–10 recent comparable listings (same city/state preferred; else nearby/statewide) and any recent SOLD prices.
 If web search is unavailable, use domain knowledge + heuristics. Always output ONLY valid JSON:
 
 {
-  "market_price": number,                         // INR (plain number, no commas)
+  "market_price": number,
   "price_band": { "low": number, "high": number },
-  "suggestion": number,                           // quick-sale listing price
+  "suggestion": number,
   "confidence": "low" | "medium" | "high",
-  "condition_note": string,                       // effect of condition/age/owner/accident/papers
-  "notes": string,                                // short reasoning (<= 2 lines)
+  "condition_note": string,
+  "notes": string,
   "old_sold_samples": [
     { "title": string, "price": number, "location": string, "date": string, "url": string, "condition": string, "note": string }
   ]
 }
 
-Adjustments guideline:
+Adjustments:
 - Vehicles: New/Good tyres + no accidents + all papers + 1st owner => +5–10%;
   Minor accidents, worn tyres, 2nd/3rd owner, expiring/expired PUC/insurance => -5–15%.
 - Mobiles/Electronics: age >2y / heavy wear => -10–20%; mint/boxed => +5–10%.
@@ -108,10 +111,9 @@ Search intent: Find comparable & sold in/near ${city || state || "India"} for "$
   return { system, user, userQuery };
 }
 
-function buildPayload({ system, user }, { withWebSearch }) {
+function buildPayload({ system, user }, { withWebSearch, model }) {
   const base = {
-    model: MODEL,
-    reasoning: { effort: "medium" },
+    model, // "gpt-5-mini" (default) or "gpt-5" etc.
     input: [
       { role: "system", content: system },
       { role: "user",   content: user  }
@@ -127,7 +129,6 @@ function buildPayload({ system, user }, { withWebSearch }) {
 
 exports.handler = async (event) => {
   const CORS = corsHeaders(event.headers.origin || event.headers.Origin || "");
-
   if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
   if (event.httpMethod !== "POST")   return bad("POST only", CORS);
 
@@ -140,10 +141,15 @@ exports.handler = async (event) => {
       || event.headers["X-OpenAI-Key"];
     if (!key) return bad("Missing OpenAI API key", CORS);
 
+    const reqModel =
+      event.headers["x-openai-model"] ||
+      event.headers["X-OpenAI-Model"] ||
+      DEFAULT_MODEL;
+
     const prompts = buildPrompts(input);
 
-    // Try with web_search first
-    let payload = buildPayload(prompts, { withWebSearch: true });
+    // Attempt with web_search tool first
+    let payload = buildPayload(prompts, { withWebSearch: true, model: reqModel });
     let resp = await fetch(OPENAI_URL, {
       method: "POST",
       headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
@@ -151,12 +157,15 @@ exports.handler = async (event) => {
     });
     let data = await resp.json();
 
-    // If web_search not enabled/unsupported, retry without tools
-    const toolUnsupported = !resp.ok && /web[_-]?search|tool|unsupported|not enabled|Unknown tool/i.test(
-      data?.error?.message || JSON.stringify(data)
-    );
+    // If tool unsupported / disabled, retry without tools
+    const toolUnsupported =
+      (!resp.ok) &&
+      /web[_-]?search|tool|unsupported|not enabled|Unknown tool/i.test(
+        data?.error?.message || JSON.stringify(data)
+      );
+
     if (toolUnsupported) {
-      payload = buildPayload(prompts, { withWebSearch: false });
+      payload = buildPayload(prompts, { withWebSearch: false, model: reqModel });
       resp = await fetch(OPENAI_URL, {
         method: "POST",
         headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
@@ -170,9 +179,13 @@ exports.handler = async (event) => {
     const text = extractText(data);
     let parsed = null;
     try { parsed = text && JSON.parse(text); } catch (_) {}
-    if (!parsed || typeof parsed !== "object") return bad("Failed to parse JSON from model response", CORS);
+    if (!parsed || typeof parsed !== "object")
+      return bad("Failed to parse JSON from model response", CORS);
 
-    return ok({ result: parsed, _meta: { q: prompts.userQuery, used_web_search: !toolUnsupported } }, CORS);
+    return ok(
+      { result: parsed, _meta: { q: prompts.userQuery, used_web_search: !toolUnsupported, model: reqModel } },
+      CORS
+    );
   } catch (e) {
     return bad(e?.message || e, CORS);
   }

@@ -1,7 +1,6 @@
-/* netlify/functions/price-advisor-proxy.js
-   Same-origin proxy on bechobazaar.com → forwards to remote function on bechobazaarui.netlify.app
-*/
-const TARGET = "https://bechobazaarui.netlify.app/.netlify/functions/price-advisor-web";
+// netlify/functions/price-advisor-proxy.js
+
+const UI_FN_URL = "https://bechobazaarui.netlify.app/.netlify/functions/price-advisor-web";
 
 function cors() {
   return {
@@ -12,24 +11,38 @@ function cors() {
     "Access-Control-Max-Age": "600"
   };
 }
+const ok  = (b)=>({ statusCode:200, headers:cors(), body:JSON.stringify(b) });
+const bad = (s,m)=>({ statusCode:s, headers:cors(), body:JSON.stringify({ error:m }) });
 
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: cors(), body: "" };
-  if (event.httpMethod !== "POST") return { statusCode: 400, headers: cors(), body: JSON.stringify({ error: "POST only" }) };
-
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: cors(), body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return bad(405, "POST only");
+  }
   try {
-    const r = await fetch(TARGET, {
+    const body = event.body || "{}";
+    const plan = event.headers?.["x-plan"] || "free";
+
+    const r = await fetch(UI_FN_URL, {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "X-Plan": event.headers["x-plan"] || "free"
+        "content-type": "application/json",
+        "x-plan": plan
       },
-      body: event.body
+      body
     });
-
     const text = await r.text();
-    return { statusCode: r.status, headers: cors(), body: text };
+    let data;
+    try { data = JSON.parse(text); } catch { data = { raw:text }; }
+
+    if (!r.ok) {
+      const msg = data?.error || r.statusText || ("HTTP "+r.status);
+      return bad(r.status, msg);
+    }
+    return ok(data);
   } catch (e) {
-    return { statusCode: 502, headers: cors(), body: JSON.stringify({ error: "Proxy failed: " + String(e) }) };
+    return bad(400, String(e.message || e));
   }
 };

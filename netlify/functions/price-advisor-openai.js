@@ -1,192 +1,188 @@
 // netlify/functions/price-advisor-openai.js
-// Node 18+ (built-in fetch). Uses OpenAI "responses" API.
-// Returns structured market-price analysis JSON for your form.
 
+// ====== Config ======
 const OPENAI_URL = "https://api.openai.com/v1/responses";
+const DEFAULT_MODEL_FREE = "gpt-4o-mini";  // cheapest, good quality
+const DEFAULT_MODEL_PRO  = "gpt-5-mini";   // better reasoning
+const DEFAULT_MODEL_VIP  = "gpt-5";        // premium
 
-// Default model (you can switch to "gpt-5")
-const DEFAULT_MODEL = "gpt-5-mini";
-
-// --- CORS: allow only your sites (edit this list) ---
-const ALLOWED = new Set([
-  "https://bechobazaar.com",
-  "https://www.bechobazaar.com",
-  // add your new Netlify site domain here:
-  "https://<YOUR-NEW-SITE>.netlify.app",
-  // keep if you still test on the old one:
-  "https://bechobazaarui.netlify.app"
-]);
-
-function corsHeaders(origin) {
-  const allow = ALLOWED.has(origin) ? origin : "https://bechobazaar.com";
+// CORS helper (allow your domains only in prod if you want)
+function corsHeaders(origin = "*") {
   return {
-    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Origin": origin || "*",
     "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-openai-key, x-openai-model",
-    "Vary": "Origin"
+    "Access-Control-Allow-Headers": "Content-Type, X-Plan, X-OpenAI-Model",
+    "Vary": "Origin",
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store"
   };
 }
 
-const ok  = (body, CORS) => ({ statusCode: 200, headers: CORS, body: JSON.stringify(body) });
-const bad = (msg,  CORS) => ({ statusCode: 400, headers: CORS, body: JSON.stringify({ error: String(msg) }) });
+const ok = (body, C) => ({ statusCode: 200, headers: C, body: JSON.stringify(body) });
+const bad = (msg, C, code = 400) =>
+  ({ statusCode: code, headers: C, body: JSON.stringify({ error: String(msg) }) });
 
-// Extract text from Responses API
-function extractText(respJson) {
-  // try the most common shapes
-  const t1 = respJson?.output?.[0]?.content?.[0]?.text;
-  if (t1) return t1;
-  if (respJson?.output_text) return respJson.output_text;
-  try {
-    const chunks = [];
-    for (const msg of respJson?.output || []) {
-      for (const part of msg?.content || []) {
-        if (typeof part?.text === "string") chunks.push(part.text);
+// ====== Prompt builder ======
+function buildPrompts(input) {
+  const {
+    category = "", brand = "", model = "", city = "", state = "", price = ""
+  } = input || {};
+
+  const system = [
+    "You are a pricing advisor for an Indian classifieds marketplace.",
+    "You must return ONLY JSON that matches the required schema.",
+    "Use Indian market context, Indian numbering and rupees.",
+    "If info is missing, make reasonable assumptions and mark confidence low."
+  ].join("\n");
+
+  const user = [
+    "Make a fair-market price analysis for this listing:",
+    `Category: ${category}`,
+    `Brand: ${brand}`,
+    `Model: ${model}`,
+    `City: ${city}`,
+    `State: ${state}`,
+    `Asking Price (₹): ${price}`,
+    "",
+    "Return JSON with schema:",
+    `{
+      "ok": true,
+      "market_price_low": number,     // ₹ lower bound
+      "market_price_high": number,    // ₹ upper bound
+      "suggested_price": number,      // ₹ single fair value
+      "confidence": "low|medium|high",
+      "why": string,                  // human explanation (concise)
+      "signals": {                    // drivers used
+        "brand_strength": "low|med|high",
+        "model_popularity": "low|med|high",
+        "age_wear": "low|med|high",
+        "local_demand": "low|med|high"
+      },
+      "old_vs_new": {
+        "launch_mrp": number|null,    // if relevant
+        "typical_used": number|null
       }
+    }`
+  ].join("\n");
+
+  return { system, user };
+}
+
+// ====== OpenAI call (Responses API) ======
+async function callOpenAI({ key, model, system, user }) {
+  const payload = {
+    model,
+    input: [
+      { role: "system", content: system },
+      { role: "user",   content: user   }
+    ],
+    // Ask for strict JSON output
+    response_format: { type: "json_object" },
+    max_output_tokens: 800,
+    temperature: 0.2
+  };
+
+  const resp = await fetch(OPENAI_URL, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "authorization": `Bearer ${key}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  return { ok: resp.ok, status: resp.status, data };
+}
+
+// Extract text from Responses API (assistant output)
+function extractTextFromResponses(json) {
+  try {
+    // The Responses API returns output as an array of content parts.
+    const firstOut = json?.output?.[0];
+    if (firstOut?.content?.length) {
+      const txt = firstOut.content
+        .map(p => p?.text || "")
+        .join("\n")
+        .trim();
+      return txt;
     }
-    if (chunks.length) return chunks.join("\n");
-  } catch (_) {}
+    // Older/alt shapes fallback:
+    const choice = json?.choices?.[0]?.message?.content;
+    if (choice) return String(choice);
+  } catch {}
   return "";
 }
 
-function buildPrompts(input) {
-  const {
-    category, subCategory, sellerType, brand, model, title,
-    state, city, area, price,
-    kmDriven, yearOfPurchase, ownership,
-    tyreCondition, accidentStatus, allPapersAvail,
-    pollutionExpiry, taxExpiry, insuranceExpiry,
-    propertyType, bhk, furnishing, facing, propertyArea, bedrooms, bathrooms,
-    descPlain
-  } = input;
-
-  const userQuery = [
-    title || `${brand || ""} ${model || ""}`.trim(),
-    category, subCategory, propertyType, bhk,
-    city, state, area,
-    yearOfPurchase ? `year ${yearOfPurchase}` : "",
-    kmDriven ? `${kmDriven} km` : "",
-    ownership, tyreCondition, accidentStatus, allPapersAvail,
-  ].filter(Boolean).join(" • ");
-
-  const system = `
-You are a price advisor for a classifieds marketplace in India.
-
-Derive 5–10 recent comparable listings (same city/state preferred; else nearby/statewide) and any recent SOLD prices.
-If web search is unavailable, use domain knowledge + heuristics. Always output ONLY valid JSON:
-
-{
-  "market_price": number,
-  "price_band": { "low": number, "high": number },
-  "suggestion": number,
-  "confidence": "low" | "medium" | "high",
-  "condition_note": string,
-  "notes": string,
-  "old_sold_samples": [
-    { "title": string, "price": number, "location": string, "date": string, "url": string, "condition": string, "note": string }
-  ]
-}
-
-Adjustments:
-- Vehicles: New/Good tyres + no accidents + all papers + 1st owner => +5–10%;
-  Minor accidents, worn tyres, 2nd/3rd owner, expiring/expired PUC/insurance => -5–15%.
-- Mobiles/Electronics: age >2y / heavy wear => -10–20%; mint/boxed => +5–10%.
-- Properties: consider ₹/sqft, locality comps, BHK, furnishing, facing.
-
-Currency is INR. Return JSON only.`.trim();
-
-  const user = `
-Item: ${title || `${brand || ""} ${model || ""}`.trim()}
-Category: ${category || ""}
-Subcategory: ${subCategory || ""}
-Brand: ${brand || ""}
-Model: ${model || ""}
-Seller Type: ${sellerType || ""}
-Vehicle: year=${yearOfPurchase || ""}, km=${kmDriven || ""}, owner=${ownership || ""}, tyre=${tyreCondition || ""}, accident=${accidentStatus || ""}, papers=${allPapersAvail || ""}, PUC=${pollutionExpiry || ""}, tax=${taxExpiry || ""}, insurance=${insuranceExpiry || ""}
-Property: type=${propertyType || ""}, bhk=${bhk || ""}, area_sqft=${propertyArea || ""}, facing=${facing || ""}, furnishing=${furnishing || ""}, beds=${bedrooms || ""}, baths=${bathrooms || ""}
-Location: ${area ? area + ", " : ""}${city || ""}, ${state || ""}
-Asking price: ${price || ""}
-Short description: ${descPlain?.slice(0, 240) || ""}
-Search intent: Find comparable & sold in/near ${city || state || "India"} for "${userQuery}".`.trim();
-
-  return { system, user, userQuery };
-}
-
-function buildPayload({ system, user }, { withWebSearch, model }) {
-  const base = {
-    model, // "gpt-5-mini" (default) or "gpt-5" etc.
-    input: [
-      { role: "system", content: system },
-      { role: "user",   content: user  }
-    ],
-    max_output_tokens: 900
-  };
-  if (withWebSearch) {
-    base.tools = [{ type: "web_search" }];
-    base.tool_choice = "auto";
-  }
-  return base;
+// simple model chooser by plan
+function pickModelFromPlan(planHdr, explicitHeaderModel) {
+  if (explicitHeaderModel) return explicitHeaderModel;
+  const plan = String(planHdr || "").toLowerCase(); // "free"|"pro"|"vip"
+  if (plan === "vip") return DEFAULT_MODEL_VIP;
+  if (plan === "pro") return DEFAULT_MODEL_PRO;
+  return DEFAULT_MODEL_FREE;
 }
 
 exports.handler = async (event) => {
-  const CORS = corsHeaders(event.headers.origin || event.headers.Origin || "");
-  if (event.httpMethod === "OPTIONS") return { statusCode: 204, headers: CORS, body: "" };
-  if (event.httpMethod !== "POST")   return bad("POST only", CORS);
+  const origin = event.headers.origin || event.headers.Origin || "*";
+  const C = corsHeaders(origin);
+
+  if (event.httpMethod === "OPTIONS") {
+    return { statusCode: 204, headers: C, body: "" };
+  }
+  if (event.httpMethod !== "POST") {
+    return bad("POST only", C, 405);
+  }
 
   try {
-    const { input } = JSON.parse(event.body || "{}");
-    if (!input) return bad("missing input", CORS);
+    const envKey = process.env.OPENAI_API_KEY || "";
+    const body = JSON.parse(event.body || "{}");
+    const input = body?.input || null;
 
-    const key = process.env.OPENAI_API_KEY
-      || event.headers["x-openai-key"]
-      || event.headers["X-OpenAI-Key"];
-    if (!key) return bad("Missing OpenAI API key", CORS);
+    if (!input) return bad("Missing 'input' object", C);
 
-    const reqModel =
-      event.headers["x-openai-model"] ||
-      event.headers["X-OpenAI-Model"] ||
-      DEFAULT_MODEL;
+    // Allow forcing a model via header (debug), else choose by plan
+    const headerModel = event.headers["x-openai-model"] || event.headers["X-OpenAI-Model"];
+    const planHdr = event.headers["x-plan"] || event.headers["X-Plan"];
 
-    const prompts = buildPrompts(input);
+    const model = pickModelFromPlan(planHdr, headerModel);
 
-    // Attempt with web_search tool first
-    let payload = buildPayload(prompts, { withWebSearch: true, model: reqModel });
-    let resp = await fetch(OPENAI_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
-      body: JSON.stringify(payload)
-    });
-    let data = await resp.json();
+    // TEMP testing header (optional): x-openai-key
+    const headerKey = event.headers["x-openai-key"] || event.headers["X-OpenAI-Key"];
+    const OPENAI_KEY = headerKey || envKey;
+    if (!OPENAI_KEY) return bad("Missing OPENAI_API_KEY", C);
 
-    // If tool unsupported / disabled, retry without tools
-    const toolUnsupported =
-      (!resp.ok) &&
-      /web[_-]?search|tool|unsupported|not enabled|Unknown tool/i.test(
-        data?.error?.message || JSON.stringify(data)
-      );
+    // Build prompts
+    const { system, user } = buildPrompts(input);
 
-    if (toolUnsupported) {
-      payload = buildPayload(prompts, { withWebSearch: false, model: reqModel });
-      resp = await fetch(OPENAI_URL, {
-        method: "POST",
-        headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
-        body: JSON.stringify(payload)
-      });
-      data = await resp.json();
+    // Call OpenAI
+    const ans = await callOpenAI({ key: OPENAI_KEY, model, system, user });
+
+    if (!ans.ok) {
+      const emsg = ans?.data?.error?.message || JSON.stringify(ans.data || {});
+      // Friendly message for quota
+      if (ans.status === 429 || /quota|exceeded|billing/i.test(emsg)) {
+        return bad("OpenAI: quota/billing limit. Check usage or billing.", C, 429);
+      }
+      return bad(`OpenAI error: ${emsg}`, C, ans.status || 400);
     }
 
-    if (!resp.ok) return bad(data?.error?.message || JSON.stringify(data), CORS);
-
-    const text = extractText(data);
+    // Extract & parse JSON
+    const raw = extractTextFromResponses(ans.data);
     let parsed = null;
-    try { parsed = text && JSON.parse(text); } catch (_) {}
-    if (!parsed || typeof parsed !== "object")
-      return bad("Failed to parse JSON from model response", CORS);
+    try { parsed = JSON.parse(raw); } catch {}
 
-    return ok(
-      { result: parsed, _meta: { q: prompts.userQuery, used_web_search: !toolUnsupported, model: reqModel } },
-      CORS
-    );
+    if (!parsed || typeof parsed !== "object") {
+      return bad("Failed to parse JSON from model", C);
+    }
+
+    return ok({
+      ok: true,
+      provider: "openai",
+      model,
+      result: parsed
+    }, C);
   } catch (e) {
-    return bad(e?.message || e, CORS);
+    return bad(e?.message || e, C, 500);
   }
 };

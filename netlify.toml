@@ -32,6 +32,12 @@
   status = 301
   force = true
 
+  [[redirects]]
+  from = "/api/price-advisor"
+  to = "/.netlify/functions/price-advisor-proxy"
+  status = 200
+
+
 # (Optional) SPA fallback — sirf agar app single index.html par route hota hai
 # [[redirects]]
 #   from = "/*"

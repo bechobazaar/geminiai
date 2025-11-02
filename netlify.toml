@@ -1,5 +1,5 @@
 [build]
-  publish = "."
+  publish = "public"
   command = ""
 
 [functions]
@@ -9,5 +9,54 @@
 [build.environment]
   NODE_VERSION = "18"
 
+# ✅ Friendly alias for functions
+[[redirects]]
+  from = "/api/*"
+  to   = "/.netlify/functions/:splat"
+  status = 200
+
+# 🛡️ Service worker: always fetch fresh
+[[headers]]
+  for = "/firebase-messaging-sw.js"
+  [headers.values]
+    Cache-Control = "no-store"
+
+# SW file should bypass SPA rewrites
+[[redirects]]
+  from = "/firebase-messaging-sw.js"
+  to   = "/firebase-messaging-sw.js"
+  status = 200
+  force = true
+
+# ✅ Serve manifest as-is (avoid SPA rewrite)
+[[redirects]]
+  from = "/manifest.webmanifest"
+  to   = "/manifest.webmanifest"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "http://www.bechobazaar.com/*"
+  to = "https://bechobazaar.com/:splat"
+  status = 301
+  force = true
+
+[[redirects]]
+  from = "https://www.bechobazaar.com/*"
+  to = "https://bechobazaar.com/:splat"
+  status = 301
+  force = true
+
+# ✅ Correct MIME for manifest
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Content-Type = "application/manifest+json; charset=utf-8"
+    Cache-Control = "no-store"
+
+# (optional) keep only if you have this function file
 [functions."auto-bump"]
-  schedule = "*/10 * * * *"   # every 10 minutes (UTC)
+  schedule = "*/10 * * * *"
+
+
+

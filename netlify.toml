@@ -1,7 +1,18 @@
 [build]
-  publish = "."
+  publish   = "."
   functions = "netlify/functions"
 
+# --- CORS for our price function
+[[headers]]
+  for = "/.netlify/functions/price-advisor-web"
+  [headers.values]
+    Access-Control-Allow-Origin  = "*"
+    Access-Control-Allow-Methods = "POST, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, X-Plan"
+    Access-Control-Max-Age       = "600"
+    Vary                         = "Origin"
+
+# Your existing static headers (examples)
 [[headers]]
   for = "/firebase-messaging-sw.js"
   [headers.values]
@@ -11,44 +22,23 @@
   for = "/manifest.webmanifest"
   [headers.values]
     Cache-Control = "no-store"
-    Content-Type = "application/manifest+json; charset=utf-8"
+    Content-Type  = "application/manifest+json; charset=utf-8"
 
-    [[headers]]
-  for = "/.netlify/functions/price-advisor-web"
-  [headers.values]
-    Access-Control-Allow-Origin = "*"
-    Access-Control-Allow-Methods = "POST, OPTIONS"
-    Access-Control-Allow-Headers = "Content-Type, X-Plan"
-    Access-Control-Max-Age = "600"
-    Vary = "Origin"
-
-# Short path for functions → /api/*
+# Short path to call functions:  /api/*
 [[redirects]]
   from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  to   = "/.netlify/functions/:splat"
   status = 200
 
-# Canonical domain redirects (optional, if using custom domain)
+# Canonical domain redirects (optional)
 [[redirects]]
   from = "http://www.bechobazaar.com/*"
-  to = "https://bechobazaar.com/:splat"
+  to   = "https://bechobazaar.com/:splat"
   status = 301
   force = true
 
 [[redirects]]
   from = "https://www.bechobazaar.com/*"
-  to = "https://bechobazaar.com/:splat"
+  to   = "https://bechobazaar.com/:splat"
   status = 301
   force = true
-
-  [[redirects]]
-  from = "/api/price-advisor"
-  to = "/.netlify/functions/price-advisor-proxy"
-  status = 200
-
-
-# (Optional) SPA fallback — sirf agar app single index.html par route hota hai
-# [[redirects]]
-#   from = "/*"
-#   to = "/index.html"
-#   status = 200
